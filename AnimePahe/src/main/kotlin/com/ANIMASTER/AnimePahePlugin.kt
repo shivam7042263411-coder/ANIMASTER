@@ -1,4 +1,4 @@
-package com.phisher98
+package com.ANIMASTER
 
 import androidx.appcompat.app.AppCompatActivity
 import com.lagradost.cloudstream3.CloudStreamApp.Companion.getKey
