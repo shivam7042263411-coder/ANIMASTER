@@ -9,7 +9,7 @@
  *   getStreams(tmdbId, mediaType, season, episode)
  */
 
-var DEFAULT_DOMAIN = "https://animepahe.com";
+var DEFAULT_DOMAIN = "https://animepahe.by";
 var USER_AGENT =
   "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 " +
   "(KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36";
@@ -27,6 +27,10 @@ function getDomain() {
     return DEFAULT_DOMAIN;
   }
   return configured.replace(/\/+$/, "");
+}
+
+function isModernDomain(domain) {
+  return /animepahe\.(?:by|ca)$/i.test(domain || "");
 }
 
 function absoluteUrl(url, base) {
@@ -133,7 +137,9 @@ function uniqueStrings(values) {
 }
 
 function getMetadata(tmdbId, mediaType) {
-  var kind = mediaType === "movie" ? "movie" : "tv";
+  // Cinemeta indexes series metadata under "series" (not "tv") and expects
+  // the same IMDb-style ID that Nuvio passes to providers.
+  var kind = mediaType === "movie" ? "movie" : "series";
   var url =
     "https://v3-cinemeta.strem.io/meta/" +
     kind +
@@ -165,6 +171,102 @@ function searchAnime(domain, title) {
     "/api?m=search&l=8&q=" +
     encodeURIComponent(title);
   return requestJson(url);
+}
+
+function getAttribute(attributes, name) {
+  var expression = new RegExp(
+    "\\b" + name + "\\s*=\\s*(['\"])([\\s\\S]*?)\\1",
+    "i"
+  );
+  var match = String(attributes || "").match(expression);
+  return match ? decodeHtmlEntities(match[2]) : "";
+}
+
+function extractModernSearchResults(body, domain) {
+  var text = String(body || "");
+  try {
+    var json = JSON.parse(text);
+    if (json && Array.isArray(json.data)) {
+      return json.data
+        .map(function (item) {
+          return {
+            title: item.title || item.name || "",
+            url: absoluteUrl(item.url || item.link, domain)
+          };
+        })
+        .filter(function (item) {
+          return item.title && item.url;
+        });
+    }
+  } catch (error) {
+    // Some AnimePahe mirrors return ready-to-render HTML instead of JSON.
+  }
+
+  var results = [];
+  var anchors = /<a\b([^>]*)>([\s\S]*?)<\/a>/gi;
+  var match;
+  while ((match = anchors.exec(text))) {
+    var url = getAttribute(match[1], "href");
+    var title = getAttribute(match[1], "title");
+    if (
+      !title ||
+      !url ||
+      !/\/anime\/[^/?#]+\/?$/i.test(url) ||
+      results.some(function (item) {
+        return item.url === absoluteUrl(url, domain);
+      })
+    ) {
+      continue;
+    }
+    results.push({
+      title: title,
+      url: absoluteUrl(url, domain)
+    });
+  }
+  return results;
+}
+
+function searchModernAnime(domain, title) {
+  var url;
+  if (/animepahe\.by$/i.test(domain)) {
+    // The live search widget only returns eight approximate matches. The
+    // paginated anime search includes the exact title when it exists.
+    url = domain + "/anime/?q=" + encodeURIComponent(title);
+  } else {
+    url =
+      domain +
+      "/wp-admin/admin-ajax.php?action=ap_search&q=" +
+      encodeURIComponent(title);
+  }
+
+  return request(url).then(function (result) {
+    return extractModernSearchResults(result.body, domain);
+  });
+}
+
+function findModernAnime(domain, titles, year, index, best) {
+  if (index >= titles.length || index >= 3) {
+    return Promise.resolve(best && best.url ? best : null);
+  }
+
+  return searchModernAnime(domain, titles[index]).then(function (results) {
+    var current = best;
+    results.forEach(function (result) {
+      var score = scoreSearchResult(result, titles[index], year);
+      if (score >= 0 && (!current || score > current._score)) {
+        current = {
+          title: result.title || titles[index],
+          url: result.url,
+          _score: score
+        };
+      }
+    });
+
+    if (current && current._score >= 100) {
+      return current;
+    }
+    return findModernAnime(domain, titles, year, index + 1, current);
+  });
 }
 
 function scoreSearchResult(result, requestedTitle, year) {
@@ -287,7 +389,13 @@ function decodeHtmlEntities(value) {
     .replace(/&amp;/g, "&")
     .replace(/&quot;/g, '"')
     .replace(/&#39;/g, "'")
-    .replace(/&#x27;/g, "'");
+    .replace(/&#x27;/g, "'")
+    .replace(/&#(\d+);/g, function (_, code) {
+      return String.fromCharCode(Number(code));
+    })
+    .replace(/&#x([0-9a-f]+);/gi, function (_, code) {
+      return String.fromCharCode(parseInt(code, 16));
+    });
 }
 
 function extractAttributeTags(html, tagName, attributeName) {
@@ -362,6 +470,204 @@ function resolveMediaLink(url, domain) {
     });
 }
 
+function decodeCustomBase64(value) {
+  var alphabet =
+    "RB0fpH8ZEyVLkv7c2i6MAJ5u3IKFDxlS1NTsnGaqmXYdUrtzjwObCgQP94hoeW+/=";
+  var bytes = [];
+  var input = String(value || "");
+
+  for (var offset = 0; offset < input.length; offset += 4) {
+    var chunk = input.slice(offset, offset + 4);
+    while (chunk.length < 4) chunk += "=";
+    var values = [];
+    for (var index = 0; index < 4; index += 1) {
+      var valueIndex = alphabet.indexOf(chunk.charAt(index));
+      values.push(valueIndex < 0 ? 64 : valueIndex);
+    }
+    bytes.push((values[0] << 2) | (values[1] >> 4));
+    if (values[2] !== 64) {
+      bytes.push(((values[1] & 15) << 4) | (values[2] >> 2));
+    }
+    if (values[3] !== 64) {
+      bytes.push(((values[2] & 3) << 6) | values[3]);
+    }
+  }
+
+  if (typeof TextDecoder !== "undefined") {
+    return new TextDecoder().decode(new Uint8Array(bytes));
+  }
+
+  var encoded = bytes
+    .map(function (byte) {
+      return "%" + ("00" + byte.toString(16)).slice(-2);
+    })
+    .join("");
+  try {
+    return decodeURIComponent(encoded);
+  } catch (error) {
+    return "";
+  }
+}
+
+function decodeVidnestResponse(body) {
+  var payload;
+  try {
+    payload = JSON.parse(body);
+  } catch (error) {
+    return null;
+  }
+  if (!payload || !payload.encrypted) return payload;
+  if (typeof payload.data !== "string") return null;
+  var decoded = decodeCustomBase64(payload.data);
+  try {
+    return JSON.parse(decoded);
+  } catch (error) {
+    return null;
+  }
+}
+
+function resolveVidnestLink(url) {
+  var match = String(url || "").match(
+    /vidnest\.fun\/anime\/([^/?#]+)\/([^/?#]+)\/(sub|dub)/i
+  );
+  if (!match) return Promise.resolve(null);
+
+  var apiUrl =
+    "https://new.vidnest.fun/hianime/anime/" +
+    encodeURIComponent(match[1]) +
+    "/" +
+    encodeURIComponent(match[2]) +
+    "/" +
+    match[3].toLowerCase();
+
+  return request(apiUrl, {
+    headers: { Referer: "https://vidnest.fun/" }
+  })
+    .then(function (result) {
+      var payload = decodeVidnestResponse(result.body);
+      var sources = payload && Array.isArray(payload.sources)
+        ? payload.sources
+        : [];
+      var source = sources.find(function (item) {
+        return item && (item.file || item.url);
+      });
+      if (!source) return null;
+
+      var subtitles = Array.isArray(payload.tracks)
+        ? payload.tracks
+            .filter(function (track) {
+              return track && track.file;
+            })
+            .map(function (track) {
+              return {
+                url: track.file,
+                label: track.label || "English",
+                language: track.label || "en"
+              };
+            })
+        : [];
+
+      return {
+        url: source.file || source.url,
+        headers: {
+          Referer: "https://vidnest.fun/",
+          "User-Agent": USER_AGENT
+        },
+        subtitles: subtitles
+      };
+    })
+    .catch(function () {
+      return null;
+    });
+}
+
+function getModernEpisodeSources(domain, anime, episodeNumber) {
+  return request(anime.url)
+    .then(function (animePage) {
+      var templateMatch = String(animePage.body).match(
+        /data-ep-url\s*=\s*(['"])([\s\S]*?)\1/i
+      );
+      var watchUrl = "";
+      if (templateMatch) {
+        watchUrl = decodeHtmlEntities(templateMatch[2]).replace(
+          /__EPNUM__/g,
+          String(episodeNumber)
+        );
+      } else {
+        var episodePattern = new RegExp(
+          "href\\s*=\\s*(['\"])([^'\"]+\\/watch\\/[^'\"]*-ep-" +
+            String(episodeNumber) +
+            "\\/?[^'\"]*)\\1",
+          "i"
+        );
+        var episodeMatch = String(animePage.body).match(episodePattern);
+        if (episodeMatch) watchUrl = decodeHtmlEntities(episodeMatch[2]);
+      }
+      return watchUrl ? request(absoluteUrl(watchUrl, domain)) : null;
+    })
+    .then(function (watchPage) {
+      if (!watchPage) return [];
+      var links = extractAttributeTags(
+        watchPage.body,
+        "button",
+        "data-src"
+      );
+      var defaultMatch = String(watchPage.body).match(
+        /animepahe_default_url\s*=\s*(['"])([\s\S]*?)\1/i
+      );
+      if (defaultMatch) {
+        links.unshift({
+          url: decodeHtmlEntities(defaultMatch[2]),
+          label: "AnimePahe default"
+        });
+      }
+
+      var unique = {};
+      links = links.filter(function (link) {
+        if (!link.url || unique[link.url]) return false;
+        unique[link.url] = true;
+        return true;
+      });
+
+      return Promise.all(
+        links.map(function (link) {
+          var resolver = /vidnest\.fun\/anime\//i.test(link.url)
+            ? resolveVidnestLink(link.url)
+            : resolveMediaLink(link.url, domain);
+          return resolver.then(function (media) {
+            if (!media) return null;
+            return {
+              name: "AnimePahe",
+              title:
+                (anime.title || "AnimePahe") +
+                " - Episode " +
+                String(episodeNumber),
+              url: media.url,
+              quality: extractQuality(link.label),
+              headers: media.headers,
+              subtitles: media.subtitles || []
+            };
+          });
+        })
+      ).then(function (streams) {
+        return uniqueStreams(
+          streams.filter(function (stream) {
+            return !!stream;
+          })
+        );
+      });
+    });
+}
+
+function getModernStreams(domain, metadata, titles, episodeNumber) {
+  return findModernAnime(domain, titles, metadata.year, 0, null).then(
+    function (anime) {
+      if (!anime) return [];
+      return getModernEpisodeSources(domain, anime, episodeNumber);
+    }
+  );
+}
+
 function uniqueStreams(streams) {
   var seen = {};
   return streams.filter(function (stream) {
@@ -379,6 +685,14 @@ function getStreams(tmdbId, mediaType, season, episode) {
     .then(function (metadata) {
       var titles = getTitleCandidates(metadata);
       if (!titles.length) return null;
+      if (isModernDomain(domain)) {
+        return {
+          modern: true,
+          metadata: metadata,
+          titles: titles,
+          episodeNumber: getEpisodeNumber(metadata, season, episode)
+        };
+      }
       return findAnimeSession(domain, titles, metadata.year, 0, null).then(
         function (anime) {
           if (!anime) return null;
@@ -392,6 +706,14 @@ function getStreams(tmdbId, mediaType, season, episode) {
     })
     .then(function (context) {
       if (!context) return [];
+      if (context.modern) {
+        return getModernStreams(
+          domain,
+          context.metadata,
+          context.titles,
+          context.episodeNumber
+        );
+      }
       return getEpisodeSession(
         domain,
         context.anime.session,
@@ -483,6 +805,8 @@ function onSettings() {
       description:
         "AnimePahe domains change often. Pick a domain that opens normally in your browser.",
       options: [
+        { label: "animepahe.by", value: "https://animepahe.by" },
+        { label: "animepahe.ca", value: "https://animepahe.ca" },
         { label: "animepahe.com", value: "https://animepahe.com" },
         { label: "animepahe.org", value: "https://animepahe.org" },
         { label: "animepahe.pw", value: "https://animepahe.pw" }
